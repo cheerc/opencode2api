@@ -12,7 +12,7 @@ let csrf = "",
   logRenderPending = false,
   toastTimer = null;
 const pages = {
-  availability: ["13", "免费模型可用性", "每小时探测，明确失效后禁用并每 24 小时复测。"],
+  availability: ["13", "免费模型可用性", "每小时探测，手动控制的模型不受影响。"],
   rotation: ["12", "模型轮转", "共享当前模型、故障切换与尝试记录。"],
   overview: ["01", "运行桌面", "最近一小时、进程累计与当前资源状态。"],
   guide: ["02", "首次运行", "用六个检查点完成从配置到首个请求。"],
@@ -1401,11 +1401,12 @@ async function loadAvailability() {
         item.model,
         item.disabled ? "已禁用" : "已启用",
         [item.channel, item.reason].filter(Boolean).join(" / ") || "待探测",
+        item.manual ? "手动" : "自动",
         item.auto_effort?.effort
           ? `${item.auto_effort.effort}（${date(item.effort_checked_at)}）`
           : "未验证",
         date(item.checked_at),
-        date(item.next_check),
+        item.manual ? "手动控制，不自动探测" : date(item.next_check),
       ]) {
         const cell = document.createElement("td");
         cell.textContent = value;
@@ -1417,6 +1418,7 @@ async function loadAvailability() {
       button.disabled = !item.disabled;
       button.onclick = async () => {
         button.disabled = true;
+        toggle.disabled = true;
         try {
           await api("/api/models/restore", {
             method: "POST",
@@ -1426,10 +1428,31 @@ async function loadAvailability() {
           await loadDebugModels();
         } catch (error) {
           $("#availability-error").textContent = error.message;
-          button.disabled = false;
+          button.disabled = !item.disabled;
+          toggle.disabled = false;
         }
       };
       cell.append(button);
+      const toggle = document.createElement("button");
+      toggle.className = "ghost";
+      toggle.textContent = item.manual ? "切回自动" : "切为手动";
+      toggle.onclick = async () => {
+        button.disabled = true;
+        toggle.disabled = true;
+        try {
+          await api("/api/models/manual", {
+            method: "POST",
+            body: JSON.stringify({ model: item.model, manual: !item.manual }),
+          });
+          await loadAvailability();
+          await loadDebugModels();
+        } catch (error) {
+          $("#availability-error").textContent = error.message;
+          button.disabled = !item.disabled;
+          toggle.disabled = false;
+        }
+      };
+      cell.append(toggle);
       row.append(cell);
       $("#availability-models").append(row);
     }

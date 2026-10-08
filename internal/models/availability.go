@@ -24,6 +24,7 @@ type Availability struct {
 	NextCheck       time.Time   `json:"next_check"`
 	Reason          string      `json:"reason,omitempty"`
 	Channel         string      `json:"channel,omitempty"`
+	Manual          bool        `json:"manual,omitempty"`
 	Generation      uint64      `json:"-"`
 	ProbeVersion    int         `json:"probe_version,omitempty"`
 	AutoEffort      EffortProbe `json:"auto_effort,omitempty"`
@@ -53,11 +54,20 @@ func NewAvailabilityStore(path string) (*AvailabilityStore, error) {
 	}
 	// Legacy probes used invalid session IDs and treated temporary errors as
 	// permanent failures. These records cannot establish model unavailability.
+	// The migration stays in memory and is re-derived on every load; the next
+	// explicit write persists it.
 	for model, item := range s.items {
 		if item.ProbeVersion == 0 && item.Disabled {
 			item.Disabled = false
 			item.NextCheck = time.Time{}
 			item.Reason = "legacy_probe_recheck"
+			s.items[model] = item
+		}
+		// Manual restores predate the manual lock flag. Preserve the
+		// operator's intent: a model left as manually_enabled stays under
+		// manual control instead of falling back under automatic probing.
+		if !item.Disabled && !item.Manual && item.Reason == "manually_enabled" {
+			item.Manual = true
 			s.items[model] = item
 		}
 	}
@@ -74,16 +84,30 @@ func (s *AvailabilityStore) Get(model string) Availability {
 
 func (s *AvailabilityStore) Disabled(model string) bool { return s.Get(model).Disabled }
 
-// A manual restore invalidates results from probes that were already running.
-func (s *AvailabilityStore) Restore(model string, now time.Time) error {
+// SetManual switches a model between manual and automatic control. Manual
+// mode keeps the model enabled and excludes it from automatic probing;
+// switching back to automatic schedules a probe on the next check.
+func (s *AvailabilityStore) SetManual(model string, manual bool, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item := s.items[model]
-	previous, existed := s.items[model]
-	item.Model, item.Disabled, item.Reason = model, false, "manually_enabled"
-	item.NextCheck = now.Add(FreeModelCheckInterval)
+	item, existed := s.items[model]
+	// Retried requests must not erase disable evidence or reset the schedule.
+	if item.Manual == manual {
+		return nil
+	}
+	previous := item
+	item.Model = model
+	item.Manual = manual
 	item.Generation++
 	item.ProbeVersion = 1
+	if manual {
+		item.Disabled = false
+		item.Reason = "manually_enabled"
+		item.NextCheck = now.Add(FreeModelCheckInterval)
+	} else {
+		item.Reason = "auto_probe"
+		item.NextCheck = time.Time{}
+	}
 	s.items[model] = item
 	if err := s.saveLocked(); err != nil {
 		if existed {
@@ -96,6 +120,12 @@ func (s *AvailabilityStore) Restore(model string, now time.Time) error {
 	return nil
 }
 
+// A manual restore takes the model under manual control and invalidates
+// results from probes that were already running.
+func (s *AvailabilityStore) Restore(model string, now time.Time) error {
+	return s.SetManual(model, true, now)
+}
+
 func (s *AvailabilityStore) Record(model string, generation uint64, success bool, reason, channel string, now time.Time, effort EffortProbe) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -103,11 +133,29 @@ func (s *AvailabilityStore) Record(model string, generation uint64, success bool
 	if item.Generation != generation {
 		return nil
 	}
+	// Manual control freezes the record: automatic probes must never
+	// overwrite a manually_enabled state (neither Disabled nor Reason).
+	if item.Manual {
+		return nil
+	}
 	item.Model = model
 	if success {
 		item.Disabled = false
 	} else if reason == "model_unavailable" {
 		item.Disabled = true
+	} else if item.Disabled {
+		// An inconclusive recheck of a still-disabled model carries no new
+		// evidence. Keep the previous disable reason and backoff instead of
+		// resetting to an hourly retry with the transient error.
+		item.CheckedAt = now
+		item.ProbeVersion = 1
+		// A scheduled recheck has already reached NextCheck. Advance it to
+		// avoid probing on every scheduler tick after an inconclusive result.
+		if !item.NextCheck.After(now) {
+			item.NextCheck = now.Add(FailedModelCheckInterval)
+		}
+		s.items[model] = item
+		return s.saveLocked()
 	}
 	item.CheckedAt, item.Reason, item.Channel = now, reason, channel
 	item.ProbeVersion = 1

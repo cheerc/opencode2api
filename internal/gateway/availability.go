@@ -27,9 +27,30 @@ func (m *RuntimeManager) AvailabilitySnapshot() []models.Availability {
 func (m *RuntimeManager) RestoreModel(model string) error {
 	m.updateMu.Lock()
 	defer m.updateMu.Unlock()
+	r := m.current.Load()
+	if r == nil {
+		return errors.New("gateway runtime is unavailable")
+	}
 	for _, item := range m.AvailabilitySnapshot() {
 		if item.Model == model {
-			return m.current.Load().availability.Restore(model, time.Now().UTC())
+			return r.availability.Restore(model, time.Now().UTC())
+		}
+	}
+	return errors.New("unknown free model")
+}
+
+// SetManualModel switches a free model between manual and automatic control.
+// Manual models stay enabled and are excluded from automatic probing.
+func (m *RuntimeManager) SetManualModel(model string, manual bool) error {
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+	r := m.current.Load()
+	if r == nil {
+		return errors.New("gateway runtime is unavailable")
+	}
+	for _, item := range m.AvailabilitySnapshot() {
+		if item.Model == model {
+			return r.availability.SetManual(model, manual, time.Now().UTC())
 		}
 	}
 	return errors.New("unknown free model")
@@ -62,6 +83,9 @@ func (m *RuntimeManager) checkFreeModels(ctx context.Context) {
 			return
 		}
 		item = r.availability.Get(item.Model)
+		if item.Manual {
+			continue
+		}
 		if time.Now().Before(item.NextCheck) {
 			continue
 		}
