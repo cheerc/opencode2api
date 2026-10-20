@@ -236,6 +236,14 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			return resp, route, attempts, nil
 		}
 		lastResponse, lastErr = resp, err
+		if errors.Is(err, errDeterministicClientRejection) {
+			// The request itself was rejected. Another lane or key gets the same
+			// answer, and retrying only buries this error under the next one, so
+			// hand the upstream 4xx back as the response (nil error) and let the
+			// normal error path forward its status and body unchanged.
+			g.logger.Warn("upstream rejected the request; not retrying on other tiers", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempts", attempts, "model", route.ID)
+			return lastResponse, effectiveRoute, attempts, nil
+		}
 		if errors.Is(err, errFreeTierIPBlocked) {
 			// The free tier flagged the egress IP. A keyed tier leaves from the
 			// same network and gets the same answer, so stop here instead of
@@ -279,6 +287,15 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			return resp, keyRoute, attempts, nil
 		}
 		if resp != nil {
+			if isDeterministicClientResponse(resp.StatusCode, peekResponseBody(resp)) {
+				// Same request-level rejection as on the anonymous lane: no
+				// other tier can fix it, so return it as is.
+				g.logger.Warn("upstream rejected the request; not trying other tiers", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempts", attempts, "tier", keyRoute.Tier, "status", resp.StatusCode)
+				if lastResponse != nil {
+					httpx.DrainAndClose(lastResponse.Body)
+				}
+				return resp, keyRoute, attempts, nil
+			}
 			if lastResponse != nil {
 				httpx.DrainAndClose(lastResponse.Body)
 			}
@@ -315,6 +332,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	// result then reports errFreeTierIPBlocked even when no exit was left to
 	// try, so the caller does not fall through to the keyed tiers.
 	blocked := false
+	// halted records that the upstream rejected the request itself. The result
+	// then reports errDeterministicClientRejection so the caller keeps this
+	// 4xx instead of replacing it with a later tier's answer.
+	halted := false
 	cursor := g.anonymous.CursorFor(ids.Session)
 	limit := g.anonymous.Len()
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
@@ -423,6 +444,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				blocked = true
 				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())
 				break
+			} else if isDeterministicClientResponse(resp.StatusCode, peekResponseBody(resp)) {
+				// The request is too long, malformed, or otherwise invalid on
+				// every lane. Stop here and hand this 4xx to the client.
+				lastErr = errDeterministicClientRejection
+				halted = true
+				g.logger.Warn("upstream rejected the request; not trying other upstreams", "component", "upstream", "event", "deterministic_rejection", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				break
 			} else {
 				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			}
@@ -436,10 +464,14 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		g.observeAnonymousResult(ctx, node, nodeResp, nodeErr)
 	}
 	if lastResponse != nil {
-		// The caller keeps and forwards this response; a block only changes
-		// the error so the keyed tiers are skipped.
+		// The caller keeps and forwards this response; a block or a
+		// deterministic rejection only changes the error so the keyed tiers
+		// are skipped.
 		if blocked {
 			return lastResponse, errFreeTierIPBlocked, attempts
+		}
+		if halted {
+			return lastResponse, errDeterministicClientRejection, attempts
 		}
 		return lastResponse, nil, attempts
 	}

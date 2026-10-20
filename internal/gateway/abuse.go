@@ -66,22 +66,63 @@ func isNetworkAbuseBlock(status int, body []byte) bool {
 		strings.Contains(text, "from your current network")
 }
 
-// peekNetworkAbuseBlock classifies a response without consuming its body:
-// the bytes it reads are put back in front of the rest so downstream error
-// handling, and a retry on another exit, still see the full payload.
-func peekNetworkAbuseBlock(resp *http.Response) bool {
-	if resp == nil || resp.Body == nil || resp.StatusCode != http.StatusForbidden {
-		return false
+// peekResponseBody reads the start of a response body and puts it back in
+// front of the rest, so classification and downstream error handling both see
+// the full payload.
+func peekResponseBody(resp *http.Response) []byte {
+	if resp == nil || resp.Body == nil {
+		return nil
 	}
 	prefix, err := io.ReadAll(io.LimitReader(resp.Body, abuseProbeLimit))
+	resp.Body = replayBody(prefix, resp.Body)
 	if err != nil {
-		// The body is unusable; restore what was read and let the ordinary
-		// error path deal with the response.
-		resp.Body = replayBody(prefix, resp.Body)
+		return nil
+	}
+	return prefix
+}
+
+// peekNetworkAbuseBlock classifies a response without consuming its body.
+func peekNetworkAbuseBlock(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
 		return false
 	}
-	resp.Body = replayBody(prefix, resp.Body)
-	return isNetworkAbuseBlock(resp.StatusCode, prefix)
+	return isNetworkAbuseBlock(resp.StatusCode, peekResponseBody(resp))
+}
+
+// errDeterministicClientRejection reports that the upstream rejected the
+// request itself: the body is malformed, too long for the model, or fails the
+// same validation on every credential. Retrying on another key, lane or tier
+// cannot change that, so the request must end and the original 4xx must reach
+// the client. Without this, the first tier's real error is replaced by
+// whatever the next tier answers — typically a 401 from an unconfigured key,
+// which tells the client to re-authenticate instead of compacting.
+var errDeterministicClientRejection = errors.New("upstream rejected the request deterministically")
+
+// deterministicMarkers are the error types and codes an upstream uses for a
+// request that will fail identically everywhere. The status must be 400 or 422
+// as well: a 401, 403 or 429 can be specific to the credential or the moment.
+var deterministicMarkers = []string{
+	"invalid_request_error",
+	"invalid_request",
+	"context_length_exceeded",
+	"maximum context length",
+	"string_above_max_length",
+	"prompt is too long",
+}
+
+// isDeterministicClientResponse reports whether status and body describe a
+// request-level rejection rather than a credential or availability problem.
+func isDeterministicClientResponse(status int, body []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	for _, marker := range deterministicMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // replayBody returns a body that yields prefix and then the rest of original.

@@ -217,6 +217,9 @@ func Normalize(path string, cfg Config) (Config, error) {
 
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
+	// A placeholder copied from the documentation is not a credential. Treating
+	// it as one routes every free-model failure into a 401 from the keyed tier.
+	cfg = DropPlaceholderKeys(cfg)
 	cfg.ProxyFile = strings.TrimSpace(cfg.ProxyFile)
 	if err := resolveProxyFiles(path, &cfg); err != nil {
 		return Config{}, err
