@@ -202,6 +202,12 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		result.reason = fmt.Sprintf("http_%d", resp.StatusCode)
 		if readErr == nil {
+			// An egress block is not evidence about the model: report it as
+			// its own reason so operators see it in the WebUI instead of
+			// reading another anonymous "http_403".
+			if isNetworkAbuseBlock(resp.StatusCode, body) {
+				return probeResult{attempted: true, reason: "network_abuse_blocked"}
+			}
 			result.effortRejected = isEffortRejection(resp.StatusCode, string(body))
 			if isModelUnavailable(resp.StatusCode, string(body)) {
 				result.reason = "model_unavailable"

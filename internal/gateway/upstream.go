@@ -236,6 +236,13 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			return resp, route, attempts, nil
 		}
 		lastResponse, lastErr = resp, err
+		if errors.Is(err, errFreeTierIPBlocked) {
+			// The free tier flagged the egress IP. A keyed tier leaves from the
+			// same network and gets the same answer, so stop here instead of
+			// spending attempts that only lengthen the penalty.
+			g.logger.Warn("free tier blocked the egress IP; skipping the keyed tiers", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempts", attempts)
+			return lastResponse, effectiveRoute, attempts, lastErr
+		}
 		if len(route.KeyTiers) > 0 {
 			g.logger.Debug("anonymous request did not succeed; entering preferred key tiers", "component", "upstream", "event", "anonymous_fallback", "request_id", ids.Request, "attempts", attempts, "key_tiers", route.KeyTiers)
 		}
@@ -304,6 +311,10 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
+	// blocked records that some exit is under the free tier's IP block. The
+	// result then reports errFreeTierIPBlocked even when no exit was left to
+	// try, so the caller does not fall through to the keyed tiers.
+	blocked := false
 	cursor := g.anonymous.CursorFor(ids.Session)
 	limit := g.anonymous.Len()
 	if g.anonymous.HasPool() && g.cfg.Retry.MaxAttempts > limit {
@@ -340,6 +351,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		node := cursor.Next()
 		if node == nil {
+			// Nothing usable is left. If that is because every exit is under
+			// the free tier's block, report the block rather than the generic
+			// no-proxy error, so the keyed tiers are not entered.
+			blocked = g.anonymous.blockedExits(time.Now())
 			break
 		}
 		proxies++
@@ -353,6 +368,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			}
 			setRequestShape(ctx, false, toolAliases[index])
+			attempts++
 			if meta := telemetry.MetaFromContext(ctx); meta != nil {
 				meta.Attempts = attemptOffset + attempts
 				meta.Tier = string(config.TierZen)
@@ -396,6 +412,17 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				if isProxyFailure(err) {
 					break
 				}
+			} else if peekNetworkAbuseBlock(resp) {
+				// The free tier flagged this egress IP. The other lane leaves
+				// from the same IP and would answer the same way, so cool the
+				// exit and move on to another one instead of adding attempts
+				// that only lengthen the penalty. The body is restored, so the
+				// caller still forwards the upstream error.
+				node.proxy.markBlocked(time.Now().Add(g.freeTierBlockTTL()))
+				lastErr = errFreeTierIPBlocked
+				blocked = true
+				g.logger.Warn("free tier blocked the egress IP; cooling the exit", "component", "upstream", "event", "free_tier_ip_blocked", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "block_for", g.freeTierBlockTTL().String())
+				break
 			} else {
 				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			}
@@ -409,7 +436,15 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		g.observeAnonymousResult(ctx, node, nodeResp, nodeErr)
 	}
 	if lastResponse != nil {
+		// The caller keeps and forwards this response; a block only changes
+		// the error so the keyed tiers are skipped.
+		if blocked {
+			return lastResponse, errFreeTierIPBlocked, attempts
+		}
 		return lastResponse, nil, attempts
+	}
+	if blocked {
+		return nil, errFreeTierIPBlocked, attempts
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no healthy anonymous proxies available")

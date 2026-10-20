@@ -83,6 +83,9 @@ type Gateway struct {
 	// the header wait. Zero arms no per-attempt deadline: each attempt is then
 	// bounded only by the request-level budget.
 	attemptTimeout time.Duration
+	// freeTierBlock is how long an exit the free tier flagged stays out of the
+	// anonymous cursor. Zero uses freeTierBlockTTL.
+	freeTierBlock time.Duration
 }
 
 // New builds a Gateway for cfg: one proxy transport per runtime proxy (a
@@ -317,6 +320,14 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 			// distinction matters to clients that retry on 502.
 			if errors.Is(err, context.DeadlineExceeded) {
 				wire.WriteError(w, external, http.StatusGatewayTimeout, "upstream request timed out", "upstream_timeout", ids.Request)
+				return
+			}
+			// Every exit this request could use is under the free tier's IP
+			// block. A 502 would read as a transient upstream fault and invite
+			// the client to retry into the same penalty, so answer with the
+			// block itself.
+			if errors.Is(err, errFreeTierIPBlocked) {
+				wire.WriteError(w, external, http.StatusServiceUnavailable, freeTierBlockedMessage, "free_tier_ip_blocked", ids.Request)
 				return
 			}
 			wire.WriteError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)

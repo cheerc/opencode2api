@@ -30,19 +30,38 @@ import (
 // upstream HTTP responses (see syncProxyResult) or a passing health check;
 // checking claims the single health check allowed in flight.
 type proxyTransport struct {
-	index    int
-	name     string
-	pool     bool
-	client   *http.Client
-	bun      *http.Client
-	healthy  atomic.Bool
-	checking atomic.Bool
+	index        int
+	name         string
+	pool         bool
+	client       *http.Client
+	bun          *http.Client
+	healthy      atomic.Bool
+	checking     atomic.Bool
+	blockedUntil atomic.Int64
 }
 
 // proxyTransports holds every configured proxy route, indexed by
 // proxyTransport.index, shared by the key and anonymous node pools.
 type proxyTransports struct {
 	items []*proxyTransport
+}
+
+// blocked reports whether this exit is under the free tier's IP abuse block.
+func (t *proxyTransport) blocked(now time.Time) bool {
+	if t == nil {
+		return false
+	}
+	return t.blockedUntil.Load() > now.UnixNano()
+}
+
+// markBlocked keeps this exit out of the anonymous cursor until until. The
+// block is a property of the egress IP, so it is never cleared by a response
+// from the same exit: only another exit can serve traffic in the meantime.
+func (t *proxyTransport) markBlocked(until time.Time) {
+	if t == nil {
+		return
+	}
+	t.blockedUntil.Store(until.UnixNano())
 }
 
 // anonymousNodes gives the shared OpenCode "public" credential an independent
@@ -95,6 +114,20 @@ func (p *anonymousNodes) Len() int {
 	return len(p.nodes)
 }
 
+// blockedExits reports whether any exit is currently under the free tier's IP
+// block, and no exit at all is available to serve the request.
+func (p *anonymousNodes) blockedExits(now time.Time) bool {
+	if p == nil || len(p.nodes) == 0 {
+		return false
+	}
+	for _, node := range p.nodes {
+		if node.proxy != nil && !node.proxy.blocked(now) {
+			return false
+		}
+	}
+	return true
+}
+
 // HasPool reports whether any node uses a rotating proxy pool (#pool), which
 // lets callers make more attempts than there are nodes.
 func (p *anonymousNodes) HasPool() bool {
@@ -137,10 +170,20 @@ func (c *anonymousCursor) Next() *anonymousNode {
 		c.used = make([]bool, n)
 	}
 	now := time.Now().UnixNano()
+	isBlocked := func(node *anonymousNode) bool {
+		return node.proxy != nil && node.proxy.blockedUntil.Load() > now
+	}
 	for c.offset < n {
 		idx := (c.start + c.offset) % n
 		c.offset++
 		node := c.pool.nodes[idx]
+		if isBlocked(node) {
+			// The free tier flagged this egress IP: the answer would be the
+			// same on every lane, so neither a fresh leg nor the cooldown
+			// fallback below may return it.
+			c.used[idx] = true
+			continue
+		}
 		if node.proxy.pool || (!c.used[idx] && node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now) {
 			c.used[idx] = true
 			return node
@@ -151,7 +194,7 @@ func (c *anonymousCursor) Next() *anonymousNode {
 			idx := (c.start + c.offset) % n
 			c.offset++
 			node := c.pool.nodes[idx]
-			if node.proxy.pool {
+			if node.proxy.pool && !isBlocked(node) {
 				return node
 			}
 		}
@@ -165,6 +208,9 @@ func (c *anonymousCursor) Next() *anonymousNode {
 			continue
 		}
 		node := c.pool.nodes[idx]
+		if isBlocked(node) {
+			continue
+		}
 		healthy := node.proxy.healthy.Load()
 		until := node.cooldownUntil.Load()
 		if choice < 0 || (healthy && !choiceHealthy) || (healthy == choiceHealthy && until < earliest) {
